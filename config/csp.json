@@ -58,7 +58,14 @@
     },
     "alarm": {
       "latch_reset_delay_s": 5.0,
-      "escalation_window_s": 120.0
+      "escalation_window_s": 120.0,
+      "correlation_window_s": 30.0,
+      "recovery_hold_s": 3.0,
+      "ambiguity_policy": {
+        "default": "report_worst",
+        "salt": "pend",
+        "steam": "pend"
+      }
     }
   }
 }

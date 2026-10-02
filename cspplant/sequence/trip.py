@@ -102,11 +102,39 @@ def reset_after_trip(
     latch: FaultLatch,
     now: float,
     operator: str,
+    trip_basis: dict | None = None,
+    basis_recovered: bool = True,
 ) -> dict:
-    """复位一次停堆：先清闩锁，再复位吸热器。"""
+    """复位一次停堆：先确认首因已恢复，再清闩锁，最后复位吸热器。
+
+    带停堆依据（首因）的复位必须先看到首因确实恢复；首因未恢复时复位被拒，
+    拒绝理由与依据一起进报告，保证投运依据与审计一致。
+    """
 
     steps: list[dict] = []
     violations: list[str] = []
+
+    if trip_basis is not None:
+        if not basis_recovered:
+            violations.append(f"首因 {trip_basis['rule']} 未恢复，不允许复位投运")
+            return {
+                "ok": False,
+                "steps": steps,
+                "violations": violations,
+                "trip_basis": dict(trip_basis),
+                "state": receiver.state(),
+            }
+        steps.append(
+            {
+                "component": "alarm",
+                "action": "verify_first_out",
+                "detail": {
+                    "group": trip_basis["group"],
+                    "rule": trip_basis["rule"],
+                    "recovered": True,
+                },
+            }
+        )
 
     try:
         latch_state = latch.reset(now, operator)
@@ -122,7 +150,10 @@ def reset_after_trip(
         return {"ok": False, "steps": steps, "violations": violations, "state": receiver.state()}
     steps.append({"component": "receiver", "action": "reset", "detail": {"state": state}})
 
-    return {"ok": not violations, "steps": steps, "violations": violations, "state": state}
+    report = {"ok": not violations, "steps": steps, "violations": violations, "state": state}
+    if trip_basis is not None:
+        report["trip_basis"] = dict(trip_basis)
+    return report
 
 
 def _event(rule: str, reason: str, value: float, threshold: float):

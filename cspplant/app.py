@@ -12,6 +12,7 @@ import dataclasses
 import math
 import threading
 
+from .alarm.correlation import AlarmCorrelator
 from .alarm.escalation import EscalationPolicy
 from .alarm.history import AlarmHistory
 from .alarm.latch import FaultLatch
@@ -176,12 +177,15 @@ class Platform:
         self.rules = AlarmRules(default_rules(self.config))
         self.history = AlarmHistory()
         self.escalation = EscalationPolicy(self.config.alarm)
+        self.correlator = AlarmCorrelator(self.config.alarm, self.rules.rules)
         self.truck = WashTruck(self.config.wash)
         self.drain = DrainSystem(self.config.wash)
         self.wash_cycle = WashCycle()
 
         self._cycles = 0
         self._operations = 0
+        self._demanded_groups: set[str] = set()
+        self._held_groups: set[str] = set()
         self._lock = threading.RLock()
         self._register_namespaces()
         self._restore()
@@ -232,21 +236,31 @@ class Platform:
             self.namespaces.register(area, device, kind)
 
     def _restore(self) -> None:
-        """从落盘状态恢复平台计数，并回放最近一次停堆原因。"""
+        """从落盘状态恢复平台计数，并回放最近一次停堆原因与停堆依据。"""
 
         state = self.store.read("platform_state")
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
+        basis = self.store.read("alarm_trip_basis")
+        if isinstance(basis, dict) and basis.get("rule"):
+            self.correlator.restore_basis(basis)
         try:
             records = self.audit.to_records(self.audit.replay_from_journal(limit=100_000))
         except PlantError:
             return
         trips = [item for item in records if item.action == "receiver_trip_complete"]
-        if trips:
+        resets = [
+            item
+            for item in records
+            if item.action == "reset_trip_complete" and item.payload.get("ok")
+        ]
+        if trips and (not resets or trips[-1].ts > resets[-1].ts):
             last = trips[-1]
             reason = str(last.payload.get("reason", "unknown"))
             self.latch.trip("receiver", reason, last.ts)
+            # 闩锁与吸热器必须一起回到跳闸态，否则复位时口径对不上。
+            self.receiver.trip(reason)
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -431,7 +445,7 @@ class Platform:
             self._persist()
             return {**report, **summary}
 
-    def trip(self, reason: str = "overtemperature") -> dict:
+    def trip(self, reason: str = "overtemperature", source: str = "receiver") -> dict:
         """停堆保护：闩锁 → 镜场收起 → 汽机旁路 → 关母管。"""
 
         with self._lock:
@@ -444,6 +458,7 @@ class Platform:
                 self.history,
                 self.clock.now(),
                 reason,
+                source,
             )
             summary = self._record_operation(op_id, "receiver_trip", report)
             self._operations += 1
@@ -451,12 +466,23 @@ class Platform:
             return {**report, **summary}
 
     def reset_trip(self, operator: str = "shift-lead") -> dict:
-        """复位停堆：先清闩锁，再复位吸热器。"""
+        """复位停堆：先确认首因已恢复，再清闩锁、复位吸热器。"""
 
         with self._lock:
             op_id = self.ids.next()
-            report = reset_after_trip(self.receiver, self.latch, self.clock.now(), operator)
+            basis = self.correlator.trip_basis()
+            report = reset_after_trip(
+                self.receiver,
+                self.latch,
+                self.clock.now(),
+                operator,
+                trip_basis=basis,
+                basis_recovered=self.correlator.basis_recovered(),
+            )
             summary = self._record_operation(op_id, "reset_trip", report)
+            if report["ok"] and basis is not None:
+                self.correlator.clear_trip_basis()
+                self.store.remove("alarm_trip_basis")
             self._operations += 1
             self._persist()
             return {**report, **summary}
@@ -595,7 +621,7 @@ class Platform:
                 "heat": heat,
                 "steam": steam_report,
                 "dispatch_pct": round(dispatch_pct, 3),
-                "alarms": [event.as_dict() for event in alarms],
+                "alarms": alarms,
                 "state": self.receiver.state(),
             }
 
@@ -611,33 +637,167 @@ class Platform:
             "salt_flow_kg_s": self.salt.flow_kg_s(),
         }
 
-    def _evaluate_alarms(self, now: float) -> list[AlarmEvent]:
-        """判定告警、写历史与审计，并在越限时触发停堆。"""
+    def _evaluate_alarms(self, now: float) -> list[dict]:
+        """判定告警、合并入组、标首因，落历史与审计，并按首因触发停堆。
 
-        events = self.rules.evaluate(self._signals())
-        if not events:
-            return []
-        self.history.record_all(now, events)
-        for event in events:
-            occurrences = self.history.occurrences(event.rule, now - self.escalation.window_s)
-            escalated = self.escalation.evaluate(occurrences, event.severity)
+        每个控制周期都要过一遍合并器（包括没有越限的周期）：清除判定、组
+        关闭与通道健康都依赖连续观察。停堆只认组合并器给出的首因；首因挂
+        起的组不出停堆依据。
+        """
+
+        signals = self._signals()
+        events = self.rules.evaluate(signals)
+        expected = {rule.signal for rule in self.rules.rules}
+        missing = expected - set(signals)
+        report = self.correlator.ingest(now, events, missing)
+        self._publish_alarm_report(report)
+        if report.demands and not self.latch.latched():
+            demand = report.demands[0]
+            basis = self.correlator.note_trip(demand.group, now)
+            self.store.write("alarm_trip_basis", basis)
+            self.trip(basis["rule"], source=basis["system"])
+        return [occurrence.as_dict() for occurrence in report.raised]
+
+    def _publish_alarm_report(self, report) -> None:
+        """把一轮合并结果逐条发上总线：首因、清除、组开合、通道健康与停堆依据。"""
+
+        for signal in report.newly_missing:
             self.bus.publish(
                 Event.of(
                     "alarm",
                     "alarm",
-                    event.rule,
-                    severity=event.severity,
-                    message=event.message,
-                    value=round(event.value, 3),
-                    threshold=round(event.threshold, 3),
-                    level=escalated.level,
-                    occurrences=occurrences,
+                    "alarm_channel_missing",
+                    severity="warning",
+                    message=f"告警通道缺失，按部分失败处理: {signal}",
+                    signal=signal,
                 )
             )
-        overtemperature = any(item.rule == "receiver-overtemperature" for item in events)
-        if overtemperature and not self.latch.latched():
-            self.trip("overtemperature")
-        return events
+        for signal in report.newly_restored:
+            self.bus.publish(
+                Event.of(
+                    "alarm",
+                    "alarm",
+                    "alarm_channel_restored",
+                    severity="notice",
+                    message=f"告警通道恢复: {signal}",
+                    signal=signal,
+                )
+            )
+        for group in report.opened:
+            first = group["first_out"]
+            self.bus.publish(
+                Event.of(
+                    "alarm",
+                    "alarm",
+                    "alarm_group_opened",
+                    severity="warning" if group["pending"] else "notice",
+                    message=(
+                        f"告警组 {group['gid']} 首因挂起"
+                        if group["pending"]
+                        else f"告警组 {group['gid']} 首因: {first['rule']}"
+                    ),
+                    group=group["gid"],
+                    first_out="" if first is None else first["rule"],
+                    pending=group["pending"],
+                    degraded=group["degraded"],
+                )
+            )
+        self.history.record_all(
+            report.ts,
+            [
+                AlarmEvent(
+                    rule=occurrence.rule,
+                    severity=occurrence.severity,
+                    signal=occurrence.signal,
+                    value=occurrence.value,
+                    threshold=occurrence.threshold,
+                    message=occurrence.message,
+                )
+                for occurrence in report.raised
+            ],
+        )
+        for occurrence in report.raised:
+            occurrences = self.history.occurrences(
+                occurrence.rule, report.ts - self.escalation.window_s
+            )
+            escalated = self.escalation.evaluate(occurrences, occurrence.severity)
+            self.bus.publish(
+                Event.of(
+                    "alarm",
+                    "alarm",
+                    occurrence.rule,
+                    severity=occurrence.severity,
+                    message=occurrence.message,
+                    value=round(occurrence.value, 3),
+                    threshold=round(occurrence.threshold, 3),
+                    level=escalated.level,
+                    occurrences=occurrences,
+                    group=occurrence.group,
+                    mark=occurrence.mark,
+                    seq=occurrence.seq,
+                    suppressed=list(occurrence.suppressed),
+                )
+            )
+        for clear in report.cleared:
+            self.bus.publish(
+                Event.of(
+                    "alarm",
+                    "alarm",
+                    "alarm_cleared",
+                    severity="notice",
+                    message=f"告警清除: {clear.rule}",
+                    **clear.as_dict(),
+                )
+            )
+        for group in report.closed:
+            first = group["first_out"]
+            self.bus.publish(
+                Event.of(
+                    "alarm",
+                    "alarm",
+                    "alarm_group_closed",
+                    severity="warning" if group["pending"] else "notice",
+                    message=(
+                        f"告警组 {group['gid']} 关闭，首因未明"
+                        if group["pending"]
+                        else f"告警组 {group['gid']} 关闭，首因: {first['rule']}"
+                    ),
+                    group=group["gid"],
+                    first_out="" if first is None else first["rule"],
+                    pending=group["pending"],
+                    degraded=group["degraded"],
+                    occurrences=len(group["occurrences"]),
+                )
+            )
+        # 停堆依据与挂起是持续状态：判定每周期都做，落审计只在状态变化时记一次。
+        for demand in report.demands:
+            if demand.group in self._demanded_groups:
+                continue
+            self.bus.publish(
+                Event.of(
+                    "alarm",
+                    "alarm",
+                    "alarm_trip_due",
+                    severity="alarm",
+                    message=f"停堆依据（首因）: {demand.basis_rule}",
+                    **demand.as_dict(),
+                )
+            )
+        self._demanded_groups = {demand.group for demand in report.demands}
+        for gid in report.held:
+            if gid in self._held_groups:
+                continue
+            self.bus.publish(
+                Event.of(
+                    "alarm",
+                    "alarm",
+                    "alarm_trip_held",
+                    severity="warning",
+                    message=f"告警组 {gid} 首因挂起，停堆依据暂不成立",
+                    group=gid,
+                )
+            )
+        self._held_groups = set(report.held)
 
     def concurrency_probe(self, rounds: int = 24) -> dict:
         """用真实并行调用探测调度与本地保护的仲裁结果。
@@ -768,6 +928,14 @@ class Platform:
                 "history": self.history.count(),
                 "by_rule": self.history.by_rule(),
                 "rules": self.rules.names(),
+                "health": self.correlator.health(),
+                "missing_channels": self.correlator.missing_channels(),
+                "groups_total": self.correlator.group_count(),
+                "groups_open": len(self.correlator.open_groups()),
+                "active_rules": self.correlator.active_rules(),
+                "trip_basis": self.correlator.trip_basis(),
+                "basis_recovered": self.correlator.basis_recovered(),
+                "clamped_timestamps": self.correlator.clamped(),
             },
             "levels": self.alert_levels(),
             "store": self.metrics.summary(),

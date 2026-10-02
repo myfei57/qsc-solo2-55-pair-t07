@@ -123,19 +123,42 @@ def _salt_page(platform: Platform) -> str:
 
 
 def _alarm_page(platform: Platform) -> str:
-    """告警页：闩锁、历史与升级等级。"""
+    """告警页：闩锁、合并组、首因与升级等级。"""
 
     status = platform.status()
     alarm = status["alarm"]
+    health = "正常" if alarm["health"] == "ok" else f"部分失败（缺失: {', '.join(alarm['missing_channels'])}）"
+    basis = alarm["trip_basis"]
     rows = [
         ("闩锁状态", "已置位" if alarm["latched"] else "已复位"),
         ("跳闸来源", alarm["source"] or "-"),
         ("跳闸原因", alarm["reason"] or "-"),
         ("累计置位", alarm["trips"]),
+        ("通道健康", health),
+        ("停堆依据（首因）", "-" if basis is None else f"{basis['rule']}（组 {basis['group']}）"),
+        ("首因已恢复", "-" if basis is None else ("是" if alarm["basis_recovered"] else "否")),
         ("告警条数", alarm["history"]),
         ("按规则计数", alarm["by_rule"] or "-"),
     ]
     body = _table("闩锁与统计", rows)
+    groups = platform.correlator.groups(10)
+    group_rows = [
+        (
+            f"{group['gid']}（{'开' if group['status'] == 'open' else '闭'}）",
+            "；".join(
+                [
+                    f"首因: {group['first_out']['rule']}"
+                    if group["first_out"]
+                    else ("首因挂起" if group["pending"] else "首因: -"),
+                    f"告警 {len(group['occurrences'])} 条",
+                    f"活跃 {group['active']}",
+                ]
+                + (["通道缺失"] if group["degraded"] else [])
+            ),
+        )
+        for group in groups
+    ] or [("暂无", "-")]
+    body += _table("合并组（时间窗合并，首因按因果链标记）", group_rows)
     level_rows = [(item["rule"], f"{item['name']}（{item['occurrences']} 次）") for item in status["levels"]]
     body += _table("升级等级", level_rows)
     recent = platform.history.recent(12)

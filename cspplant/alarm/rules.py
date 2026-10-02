@@ -46,6 +46,8 @@ class AlarmRule:
     severity: str = ALARM
     above: bool = True
     message: str = ""
+    system: str = "receiver"
+    trip: bool = False
 
     def breached(self, value: float) -> bool:
         """给定信号值是否越限。"""
@@ -60,6 +62,8 @@ class AlarmRule:
             "severity": self.severity,
             "above": self.above,
             "message": self.message,
+            "system": self.system,
+            "trip": self.trip,
         }
 
 
@@ -74,6 +78,8 @@ def default_rules(config: PlatformConfig) -> list[AlarmRule]:
             ALARM,
             True,
             "吸热器出口温度越限",
+            "receiver",
+            True,
         ),
         AlarmRule(
             "receiver-derate",
@@ -82,6 +88,7 @@ def default_rules(config: PlatformConfig) -> list[AlarmRule]:
             WARNING,
             True,
             "吸热器进入降额带",
+            "receiver",
         ),
         AlarmRule(
             "header-overpressure",
@@ -90,6 +97,7 @@ def default_rules(config: PlatformConfig) -> list[AlarmRule]:
             ALARM,
             True,
             "熔盐母管超压",
+            "salt",
         ),
         AlarmRule(
             "cold-tank-low",
@@ -98,6 +106,7 @@ def default_rules(config: PlatformConfig) -> list[AlarmRule]:
             WARNING,
             False,
             "冷盐罐液位偏低",
+            "salt",
         ),
         AlarmRule(
             "hot-tank-high",
@@ -106,6 +115,7 @@ def default_rules(config: PlatformConfig) -> list[AlarmRule]:
             WARNING,
             True,
             "热盐罐液位偏高",
+            "salt",
         ),
         AlarmRule(
             "steam-pressure",
@@ -114,6 +124,7 @@ def default_rules(config: PlatformConfig) -> list[AlarmRule]:
             WARNING,
             True,
             "主蒸汽压力偏高",
+            "steam",
         ),
     ]
 

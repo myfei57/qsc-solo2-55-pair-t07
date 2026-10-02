@@ -269,20 +269,56 @@ class WashLimits:
 
 @dataclass(frozen=True)
 class AlarmLimits:
-    """故障闩锁与升级窗口约束。"""
+    """故障闩锁、升级窗口与告警合并约束。
+
+    ``ambiguity_policy`` 以 (系统, 策略) 二元组的有序元组保存，必须含
+    ``"default"`` 键；策略取值 ``report_worst``（首因不明按最严重那条报）或
+    ``pend``（挂起等首因明确）。
+    """
 
     latch_reset_delay_s: float
     escalation_window_s: float
+    correlation_window_s: float
+    recovery_hold_s: float
+    ambiguity_policy: tuple[tuple[str, str], ...]
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "AlarmLimits":
+        raw_policy = section.get("ambiguity_policy", _MISSING)
+        if raw_policy is _MISSING:
+            raise ConfigError("配置缺少字段 'ambiguity_policy'", component="config")
+        if not isinstance(raw_policy, Mapping):
+            raise ConfigError("配置字段 'ambiguity_policy' 必须是映射", component="config")
+        policy: dict[str, str] = {}
+        for system, choice in raw_policy.items():
+            if not isinstance(system, str) or not system:
+                raise ConfigError("首因不明策略的系统名必须是非空字符串", component="config")
+            if choice not in ("report_worst", "pend"):
+                raise ConfigError(
+                    f"首因不明策略只能是 report_worst 或 pend: {system}={choice!r}",
+                    component="config",
+                )
+            policy[system] = str(choice)
+        if "default" not in policy:
+            raise ConfigError("首因不明策略必须包含 default 项", component="config")
         limits = cls(
             latch_reset_delay_s=_number(section, "latch_reset_delay_s", minimum=0.0),
             escalation_window_s=_number(section, "escalation_window_s", minimum=1.0),
+            correlation_window_s=_number(section, "correlation_window_s", minimum=1.0),
+            recovery_hold_s=_number(section, "recovery_hold_s", minimum=0.0),
+            ambiguity_policy=tuple(sorted(policy.items())),
         )
         if limits.escalation_window_s <= limits.latch_reset_delay_s:
             raise ConfigError("升级窗口必须大于闩锁复位延迟", component="config")
+        if limits.correlation_window_s > limits.escalation_window_s:
+            raise ConfigError("合并窗口不得大于升级窗口", component="config")
         return limits
+
+    def policy_for(self, system: str) -> str:
+        """返回某系统的首因不明处置策略，未配置的系统回落到 default。"""
+
+        table = dict(self.ambiguity_policy)
+        return table.get(str(system), table["default"])
 
 
 @dataclass(frozen=True)
@@ -350,7 +386,13 @@ def default_config() -> PlatformConfig:
         salt=SaltLimits(18.0, 96.0, 1.4, 15.0, 58.0, 9.0, 2.5, 3.4),
         steam=SteamLimits(12.0, 0.8, 6.0, 30.0, 1.0),
         wash=WashLimits(90.0, 26.0, 4.0, 9.0),
-        alarm=AlarmLimits(5.0, 120.0),
+        alarm=AlarmLimits(
+            5.0,
+            120.0,
+            30.0,
+            3.0,
+            (("default", "report_worst"), ("salt", "pend"), ("steam", "pend")),
+        ),
     )
 
 
@@ -415,6 +457,9 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
             "alarm": {
                 "latch_reset_delay_s": cfg.alarm.latch_reset_delay_s,
                 "escalation_window_s": cfg.alarm.escalation_window_s,
+                "correlation_window_s": cfg.alarm.correlation_window_s,
+                "recovery_hold_s": cfg.alarm.recovery_hold_s,
+                "ambiguity_policy": dict(cfg.alarm.ambiguity_policy),
             },
         },
     }

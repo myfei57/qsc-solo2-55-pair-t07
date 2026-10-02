@@ -163,10 +163,16 @@ class Api:
 
     def _alarms(self, params: dict, body: dict) -> dict:
         limit = int(params.get("limit", 20))
+        correlator = self._platform.correlator
         return {
             "recent": self._platform.history.recent(limit),
             "by_rule": self._platform.history.by_rule(),
             "latched": self._platform.latch.state().as_dict(),
+            "health": correlator.health(),
+            "missing_channels": correlator.missing_channels(),
+            "groups": correlator.groups(limit),
+            "trip_basis": correlator.trip_basis(),
+            "basis_recovered": correlator.basis_recovered(),
         }
 
     def _timeline(self, params: dict, body: dict) -> dict:
@@ -202,6 +208,8 @@ class Api:
             "flow_confirmed": platform.receiver.flow_confirmed(),
             "header_admitted": platform.receiver.header.state() == "admitted",
             "latch_clear": not platform.latch.latched(),
+            "alarm_channels_complete": platform.correlator.health() == "ok",
+            "first_out_recovered": platform.correlator.basis_recovered(),
         }
         info = {
             "receiver_state": platform.receiver.state(),

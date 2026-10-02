@@ -61,3 +61,39 @@ def test_receiver_and_salt_helpers():
     threshold = config.salt.low_flow_threshold(60.0)
     assert threshold == pytest.approx(60.0 - config.salt.flow_tolerance_kg_s)
     assert config.steam.settled(config.steam.pressure_target_mpa) is True
+
+
+def test_alarm_limits_require_correlation_fields():
+    mapping = config_to_mapping(default_config())
+    del mapping["limits"]["alarm"]["correlation_window_s"]
+    with pytest.raises(ConfigError):
+        type(default_config()).from_mapping(mapping)
+    mapping = config_to_mapping(default_config())
+    del mapping["limits"]["alarm"]["ambiguity_policy"]
+    with pytest.raises(ConfigError):
+        type(default_config()).from_mapping(mapping)
+
+
+def test_correlation_window_must_not_exceed_escalation_window():
+    mapping = config_to_mapping(default_config())
+    mapping["limits"]["alarm"]["correlation_window_s"] = 999.0
+    with pytest.raises(ConfigError):
+        type(default_config()).from_mapping(mapping)
+
+
+def test_ambiguity_policy_values_are_checked():
+    mapping = config_to_mapping(default_config())
+    mapping["limits"]["alarm"]["ambiguity_policy"] = {"default": "guess"}
+    with pytest.raises(ConfigError):
+        type(default_config()).from_mapping(mapping)
+    mapping["limits"]["alarm"]["ambiguity_policy"] = {"salt": "pend"}
+    with pytest.raises(ConfigError):
+        type(default_config()).from_mapping(mapping)
+
+
+def test_ambiguity_policy_lookup_falls_back_to_default():
+    config = default_config()
+    assert config.alarm.policy_for("salt") == "pend"
+    assert config.alarm.policy_for("steam") == "pend"
+    assert config.alarm.policy_for("receiver") == "report_worst"
+    assert config.alarm.policy_for("no-such-system") == "report_worst"
