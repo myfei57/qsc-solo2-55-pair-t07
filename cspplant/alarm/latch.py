@@ -22,6 +22,8 @@ class LatchState:
     reason: str
     tripped_at: float
     resets: int
+    group_id: str = ""
+    root_rule: str = ""
 
     def as_dict(self) -> dict:
         return {
@@ -30,6 +32,8 @@ class LatchState:
             "reason": self.reason,
             "tripped_at": round(self.tripped_at, 3),
             "resets": self.resets,
+            "group_id": self.group_id,
+            "root_rule": self.root_rule,
         }
 
 
@@ -45,13 +49,23 @@ class FaultLatch:
         self._trips = 0
         self._resets = 0
         self._rejections = 0
+        self._group_id = ""
+        self._root_rule = ""
 
     @property
     def limits(self) -> AlarmLimits:
         return self._limits
 
-    def trip(self, source: str, reason: str, now: float) -> LatchState:
-        """置闩锁；重复置位会刷新原因与时刻。"""
+    def trip(
+        self,
+        source: str,
+        reason: str,
+        now: float,
+        *,
+        group_id: str = "",
+        root_rule: str = "",
+    ) -> LatchState:
+        """置闩锁；重复置位会刷新原因与时刻，并绑定停堆首因组。"""
 
         if not source or not reason:
             raise InterlockError("闩锁必须记录来源与原因", component="alarm")
@@ -59,6 +73,8 @@ class FaultLatch:
         self._source = str(source)
         self._reason = str(reason)
         self._tripped_at = float(now)
+        self._group_id = str(group_id)
+        self._root_rule = str(root_rule)
         self._trips += 1
         return self.state()
 
@@ -86,6 +102,8 @@ class FaultLatch:
         if not operator:
             raise InterlockError("复位必须记录操作人", component="alarm")
         self._latched = False
+        self._group_id = ""
+        self._root_rule = ""
         self._resets += 1
         return self.state()
 
@@ -103,6 +121,16 @@ class FaultLatch:
         """返回置位时刻。"""
 
         return self._tripped_at
+
+    def group_id(self) -> str:
+        """返回停堆首因告警组。"""
+
+        return self._group_id
+
+    def root_rule(self) -> str:
+        """返回停堆首因规则名。"""
+
+        return self._root_rule
 
     def trips(self) -> int:
         """返回累计置位次数。"""
@@ -122,4 +150,12 @@ class FaultLatch:
     def state(self) -> LatchState:
         """返回闩锁状态快照。"""
 
-        return LatchState(self._latched, self._source, self._reason, self._tripped_at, self._resets)
+        return LatchState(
+            self._latched,
+            self._source,
+            self._reason,
+            self._tripped_at,
+            self._resets,
+            self._group_id,
+            self._root_rule,
+        )

@@ -3,6 +3,10 @@
 保护动作的顺序决定了停堆之后还能不能安全重启：先闩锁住故障，再让镜场退出
 聚焦，然后汽机走旁路卸载，最后关母管。缺少闩锁这一步，温度回落时系统会自己
 恢复聚焦，超温会反复发生。
+
+停堆归因只认告警合并组里的首因（``root_rule`` / ``group_id``），被首因带出来
+的后继告警不重复下停堆结论；闩锁落的原因与审计、控制台看到的首因必须是同一
+条。复位时首因未明确或未恢复一律拒绝，重新投运前必须看得到首因确实恢复。
 """
 
 from __future__ import annotations
@@ -27,8 +31,11 @@ def emergency_trip(
     now: float,
     reason: str = "overtemperature",
     source: str = "receiver",
+    *,
+    group_id: str = "",
+    root_rule: str = "",
 ) -> dict:
-    """执行一次停堆保护。"""
+    """执行一次停堆保护；原因绑定到合并组首因。"""
 
     steps: list[dict] = []
     violations: list[str] = []
@@ -42,12 +49,24 @@ def emergency_trip(
         }
     )
 
-    latch_state = latch.trip(source, reason, now)
+    latch_state = latch.trip(
+        source,
+        reason,
+        now,
+        group_id=group_id,
+        root_rule=root_rule or reason,
+    )
     history.record(
         now,
-        _event(f"trip-{source}", reason, receiver.output_temperature_c(), receiver.limits.temp_max_c),
+        _event(root_rule or f"trip-{source}", reason, receiver.output_temperature_c(), receiver.limits.temp_max_c),
     )
-    steps.append({"component": "alarm", "action": "latch", "detail": latch_state.as_dict()})
+    steps.append(
+        {
+            "component": "alarm",
+            "action": "latch",
+            "detail": {**latch_state.as_dict(), "group_id": group_id, "root_rule": root_rule or reason},
+        }
+    )
 
     stowed = field.stow_all()
     steps.append(
@@ -91,6 +110,8 @@ def emergency_trip(
     return {
         "ok": not violations,
         "reason": reason,
+        "group_id": group_id,
+        "root_rule": root_rule or reason,
         "steps": steps,
         "violations": violations,
         "latched": latch.latched(),
@@ -102,11 +123,24 @@ def reset_after_trip(
     latch: FaultLatch,
     now: float,
     operator: str,
+    *,
+    root_blockers: list[str] | None = None,
 ) -> dict:
-    """复位一次停堆：先清闩锁，再复位吸热器。"""
+    """复位一次停堆：先确认首因已明确并恢复、清闩锁，再复位吸热器。"""
 
     steps: list[dict] = []
     violations: list[str] = []
+
+    blockers = list(root_blockers or [])
+    if blockers:
+        violations.extend(blockers)
+        return {
+            "ok": False,
+            "steps": steps,
+            "violations": violations,
+            "state": receiver.state(),
+            "stage": "alarm",
+        }
 
     try:
         latch_state = latch.reset(now, operator)

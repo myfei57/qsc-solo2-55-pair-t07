@@ -269,19 +269,35 @@ class WashLimits:
 
 @dataclass(frozen=True)
 class AlarmLimits:
-    """故障闩锁与升级窗口约束。"""
+    """故障闩锁、升级窗口与告警合并约束。
+
+    合并口径定死为"因果链 + 固定跟随窗"：``follow_window_s`` 是后报告警允许挂到
+    因果前驱所在组的最大时间间隔。``unknown_cause_policy`` 决定首因不明时是按最
+    严重那条认定（``severity``）还是挂起等首因明确（``pending``）。
+    """
 
     latch_reset_delay_s: float
     escalation_window_s: float
+    follow_window_s: float = 30.0
+    unknown_cause_policy: str = "severity"
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "AlarmLimits":
+        policy = str(section.get("unknown_cause_policy", "severity"))
+        if policy not in ("severity", "pending"):
+            raise ConfigError(
+                "unknown_cause_policy 必须是 'severity' 或 'pending'", component="config"
+            )
         limits = cls(
             latch_reset_delay_s=_number(section, "latch_reset_delay_s", minimum=0.0),
             escalation_window_s=_number(section, "escalation_window_s", minimum=1.0),
+            follow_window_s=_number(section, "follow_window_s", minimum=1.0),
+            unknown_cause_policy=policy,
         )
         if limits.escalation_window_s <= limits.latch_reset_delay_s:
             raise ConfigError("升级窗口必须大于闩锁复位延迟", component="config")
+        if limits.follow_window_s > limits.escalation_window_s:
+            raise ConfigError("跟随窗不得大于升级窗口", component="config")
         return limits
 
 
@@ -350,7 +366,7 @@ def default_config() -> PlatformConfig:
         salt=SaltLimits(18.0, 96.0, 1.4, 15.0, 58.0, 9.0, 2.5, 3.4),
         steam=SteamLimits(12.0, 0.8, 6.0, 30.0, 1.0),
         wash=WashLimits(90.0, 26.0, 4.0, 9.0),
-        alarm=AlarmLimits(5.0, 120.0),
+        alarm=AlarmLimits(5.0, 120.0, 30.0, "severity"),
     )
 
 
@@ -415,6 +431,8 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
             "alarm": {
                 "latch_reset_delay_s": cfg.alarm.latch_reset_delay_s,
                 "escalation_window_s": cfg.alarm.escalation_window_s,
+                "follow_window_s": cfg.alarm.follow_window_s,
+                "unknown_cause_policy": cfg.alarm.unknown_cause_policy,
             },
         },
     }

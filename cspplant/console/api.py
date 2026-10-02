@@ -51,6 +51,9 @@ class Api:
         add("GET", "/api/events", self._events)
         add("GET", "/api/audit", self._audit)
         add("GET", "/api/alarms", self._alarms)
+        add("GET", "/api/alarm-groups", self._alarm_groups)
+        add("POST", "/api/alarm/assert-root", self._assert_root)
+        add("POST", "/api/signal/lost", self._signal_lost)
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/journal", self._journal)
         add("GET", "/api/store", self._store)
@@ -167,7 +170,34 @@ class Api:
             "recent": self._platform.history.recent(limit),
             "by_rule": self._platform.history.by_rule(),
             "latched": self._platform.latch.state().as_dict(),
+            "groups": self._platform.correlator.describe(),
+            "root_blockers": self._platform._root_blockers(),
+            "merge_policy": {
+                "mode": "causal_chain",
+                "follow_window_s": self._platform.correlator.window_s,
+                "unknown_cause_policy": self._platform.correlator.policy,
+            },
         }
+
+    def _alarm_groups(self, params: dict, body: dict) -> dict:
+        include_closed = str(params.get("closed", "1")) not in ("0", "false", "False")
+        groups = self._platform.correlator.groups(include_closed=include_closed)
+        return {
+            "groups": [group.as_dict() for group in reversed(groups)],
+            "pending": [group.group_id for group in self._platform.correlator.pending_groups()],
+        }
+
+    def _assert_root(self, params: dict, body: dict) -> dict:
+        return self._platform.assert_alarm_root(
+            str(body["group_id"]),
+            str(body["rule"]),
+            str(body.get("operator", "shift-lead")),
+        )
+
+    def _signal_lost(self, params: dict, body: dict) -> dict:
+        signal = str(body["signal"])
+        lost = bool(body.get("lost", True))
+        return {"status": self._platform.set_signal_lost(signal, lost)}
 
     def _timeline(self, params: dict, body: dict) -> dict:
         asset = params.get("asset")
@@ -197,16 +227,21 @@ class Api:
 
     def _readiness(self, params: dict, body: dict) -> dict:
         platform = self._platform
+        blockers = platform._root_blockers()
         checks = {
             "irradiance_durable": platform.field.durable_ready(platform.clock.now()),
             "flow_confirmed": platform.receiver.flow_confirmed(),
             "header_admitted": platform.receiver.header.state() == "admitted",
             "latch_clear": not platform.latch.latched(),
+            "root_cause_resolved_and_recovered": not blockers,
+            "signals_available": platform.signal_health.lost() == [],
         }
         info = {
             "receiver_state": platform.receiver.state(),
             "temperature_c": round(platform.receiver.output_temperature_c(), 2),
             "net_flow_kg_s": round(platform.salt.flow_kg_s(), 3),
+            "root_blockers": blockers,
+            "signals_lost": platform.signal_health.lost(),
             "last_audit_ts": platform.audit.tail(1)[-1]["ts"] if platform.audit.tail(1) else None,
         }
         return {"ready": all(checks.values()), "checks": checks, "info": info}

@@ -58,7 +58,9 @@
     },
     "alarm": {
       "latch_reset_delay_s": 5.0,
-      "escalation_window_s": 120.0
+      "escalation_window_s": 120.0,
+      "follow_window_s": 30.0,
+      "unknown_cause_policy": "severity"
     }
   }
 }

@@ -61,3 +61,17 @@ def test_receiver_and_salt_helpers():
     threshold = config.salt.low_flow_threshold(60.0)
     assert threshold == pytest.approx(60.0 - config.salt.flow_tolerance_kg_s)
     assert config.steam.settled(config.steam.pressure_target_mpa) is True
+
+
+def test_unknown_cause_policy_must_be_severity_or_pending():
+    mapping = config_to_mapping(default_config())
+    mapping["limits"]["alarm"]["unknown_cause_policy"] = "loudest"
+    with pytest.raises(ConfigError):
+        type(default_config()).from_mapping(mapping)
+
+
+def test_follow_window_cannot_exceed_escalation_window():
+    mapping = config_to_mapping(default_config())
+    mapping["limits"]["alarm"]["follow_window_s"] = 999.0
+    with pytest.raises(ConfigError):
+        type(default_config()).from_mapping(mapping)

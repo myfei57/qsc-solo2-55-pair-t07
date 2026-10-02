@@ -36,6 +36,18 @@ def _table(title: str, rows: list[tuple[str, object]]) -> str:
     return f"<h2>{escape(title)}</h2><table>{body}</table>"
 
 
+def _html_table(title: str, headers: tuple[str, str], rows: list[tuple[str, str]]) -> str:
+    """渲染一张值列允许内嵌 HTML 的表（动态片段须由调用方自行转义）。"""
+
+    body = "".join(
+        f"<tr><th>{key}</th><td>{value}</td></tr>" for key, value in rows
+    )
+    return (
+        f"<h2>{escape(title)}</h2>"
+        f"<table><tr><th>{escape(headers[0])}</th><th>{escape(headers[1])}</th></tr>{body}</table>"
+    )
+
+
 def _shell(title: str, body: str) -> str:
     """套上页头与导航。"""
 
@@ -123,19 +135,57 @@ def _salt_page(platform: Platform) -> str:
 
 
 def _alarm_page(platform: Platform) -> str:
-    """告警页：闩锁、历史与升级等级。"""
+    """告警页：闩锁、合并组、首因恢复与升级等级。"""
 
     status = platform.status()
     alarm = status["alarm"]
+    state_name = {"open": "开放", "pending": "首因挂起", "closed": "已封口"}
     rows = [
         ("闩锁状态", "已置位" if alarm["latched"] else "已复位"),
         ("跳闸来源", alarm["source"] or "-"),
         ("跳闸原因", alarm["reason"] or "-"),
+        ("停堆首因组", alarm["group_id"] or "-"),
+        ("停堆首因规则", alarm["root_rule"] or "-"),
+        ("投运首因条件", "满足" if not alarm["root_blockers"] else "；".join(alarm["root_blockers"])),
         ("累计置位", alarm["trips"]),
         ("告警条数", alarm["history"]),
+        ("合并口径", f"因果链 + 跟随窗 {alarm['merge_policy']['follow_window_s']}s（不按纯时间窗）"),
+        ("首因不明策略", "按最严重认定" if alarm["merge_policy"]["unknown_cause_policy"] == "severity" else "挂起待认定"),
+        ("缺失信号", "；".join(alarm["signals_lost"]) or "无"),
         ("按规则计数", alarm["by_rule"] or "-"),
     ]
-    body = _table("闩锁与统计", rows)
+    body = _table("闩锁与合并", rows)
+
+    group_rows: list[tuple[str, str]] = []
+    for group in status["alarm_groups"]:
+        members = "<br/>".join(
+            escape(
+                f"{item['ts']} {item['rule']} [{'首因' if item['role'] == 'root' else '带出'}"
+                + (f" ← {item['caused_by']}" if item["caused_by"] else "")
+                + (f"（已恢复@{item['recovered_ts']}）" if item["recovered"] else "（未恢复）")
+                + "]"
+            )
+            for item in reversed(group["members"])
+        )
+        head = (
+            f"{escape(group['group_id'])} {state_name.get(group['state'], group['state'])}"
+            f"{' 已停堆' if group['tripped'] else ''}"
+        )
+        group_rows.append(
+            (
+                head,
+                f"首因：{escape(group['root_rule'])}"
+                f"{'（未明确）' if not group['root_resolved'] else ''}"
+                f" | 首因{'已恢复' if group['root_recovered'] else '未恢复'}"
+                f" | 全组{'已恢复' if group['all_recovered'] else '未全恢复'}<br/>{members}",
+            )
+        )
+    body += _html_table(
+        "告警合并组（按因果链 + 跟随窗）",
+        ("组", "首因与成员（时序倒序，最新在上）"),
+        group_rows or [("暂无", "-")],
+    )
+
     level_rows = [(item["rule"], f"{item['name']}（{item['occurrences']} 次）") for item in status["levels"]]
     body += _table("升级等级", level_rows)
     recent = platform.history.recent(12)
@@ -143,7 +193,7 @@ def _alarm_page(platform: Platform) -> str:
         (f"{entry['ts']}", f"{entry['rule']} {entry['message']} = {entry['value']}") for entry in recent
     ] or [("暂无", "-")]
     body += _table("最近告警", recent_rows)
-    body += _table("规则表", [(item["name"], f"{item['signal']} {'≥' if item['above'] else '≤'} {item['threshold']}") for item in platform.rules.describe()])
+    body += _table("规则表", [(item["name"], f"{item['signal']} {'≥' if item['above'] else '≤'} {item['threshold']}{'（停堆）' if item['trips_plant'] else ''}") for item in platform.rules.describe()])
     return _shell("告警控制台", body)
 
 

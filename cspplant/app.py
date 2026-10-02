@@ -12,7 +12,10 @@ import dataclasses
 import math
 import threading
 
+from .alarm.causality_default import default_causal_graph
+from .alarm.correlator import Correlator
 from .alarm.escalation import EscalationPolicy
+from .alarm.health import SignalHealth, is_lost_rule, lost_rule, lost_signal
 from .alarm.history import AlarmHistory
 from .alarm.latch import FaultLatch
 from .alarm.rules import AlarmEvent, AlarmRules, default_rules
@@ -20,7 +23,7 @@ from .audit.log import AuditLog
 from .audit.record import AuditRecord
 from .clock import Clock, SystemClock
 from .config import PlatformConfig, default_config
-from .errors import PlantError
+from .errors import InterlockError, PlantError
 from .eventbus import Event, EventBus
 from .field.field import FieldController
 from .field.persist import FieldPersistence
@@ -176,6 +179,22 @@ class Platform:
         self.rules = AlarmRules(default_rules(self.config))
         self.history = AlarmHistory()
         self.escalation = EscalationPolicy(self.config.alarm)
+        self.causal_graph = default_causal_graph()
+        self.correlator = Correlator(self.causal_graph, self.config.alarm)
+        critical_signals = {
+            rule.signal for rule in self.rules.rules if rule.trips_plant
+        }
+        self.signal_health = SignalHealth(
+            [
+                "receiver_temperature_c",
+                "header_pressure_mpa",
+                "cold_tank_pct",
+                "hot_tank_pct",
+                "steam_pressure_mpa",
+                "salt_flow_kg_s",
+            ],
+            critical_signals,
+        )
         self.truck = WashTruck(self.config.wash)
         self.drain = DrainSystem(self.config.wash)
         self.wash_cycle = WashCycle()
@@ -232,7 +251,7 @@ class Platform:
             self.namespaces.register(area, device, kind)
 
     def _restore(self) -> None:
-        """从落盘状态恢复平台计数，并回放最近一次停堆原因。"""
+        """从落盘状态恢复平台计数、回放闩锁与告警合并组。"""
 
         state = self.store.read("platform_state")
         if isinstance(state, dict):
@@ -242,11 +261,68 @@ class Platform:
             records = self.audit.to_records(self.audit.replay_from_journal(limit=100_000))
         except PlantError:
             return
+        self._restore_alarm_groups(records)
         trips = [item for item in records if item.action == "receiver_trip_complete"]
         if trips:
             last = trips[-1]
             reason = str(last.payload.get("reason", "unknown"))
-            self.latch.trip("receiver", reason, last.ts)
+            payload = last.payload
+            self.latch.trip(
+                "receiver",
+                reason,
+                last.ts,
+                group_id=str(payload.get("group_id", "")),
+                root_rule=str(payload.get("root_rule", reason)),
+            )
+
+    def _restore_alarm_groups(self, records) -> None:
+        """从审计流水回放告警事件，重建合并组、恢复标记与停堆标记。"""
+
+        cleared: dict[float, list[str]] = {}
+        for record in records:
+            if record.component != "alarm":
+                continue
+            payload = record.payload
+            group_id = payload.get("group_id")
+            if record.action == "alarm_cleared":
+                cleared.setdefault(record.ts, []).append(str(payload.get("rule", "")))
+                continue
+            if not group_id or "role" not in payload:
+                continue
+            try:
+                self.correlator.restore_member(
+                    record.ts,
+                    record.action,
+                    str(payload.get("severity", "alarm")),
+                    str(group_id),
+                    str(payload.get("role", "root")),
+                    str(payload.get("caused_by", "")),
+                    root_resolved=True,
+                )
+            except PlantError:
+                continue
+        for ts in sorted(cleared):
+            self.correlator.mark_cleared(ts, cleared[ts])
+        tripped_groups = {
+            str(item.payload.get("group_id", ""))
+            for item in records
+            if item.action == "receiver_trip_complete" and item.payload.get("group_id")
+        }
+        for group_id in tripped_groups:
+            try:
+                self.correlator.mark_tripped(group_id)
+            except PlantError:
+                continue
+        # 挂起首因的解除以改判/认定记录为准。
+        for record in records:
+            if record.component != "alarm":
+                continue
+            if record.action in ("root_cause_reassigned", "root_cause_asserted"):
+                try:
+                    group = self.correlator.group(str(record.payload.get("group_id", "")))
+                    group.root_resolved = True
+                except PlantError:
+                    continue
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -301,6 +377,10 @@ class Platform:
         }
         if report.get("reason"):
             summary["reason"] = report["reason"]
+        # 停堆首因组与首因规则必须随汇总记录落盘，跨重启恢复才有同一口径。
+        for key in ("group_id", "root_rule"):
+            if report.get(key) is not None:
+                summary[key] = report[key]
         self.bus.publish(
             Event.of(
                 "audit",
@@ -432,10 +512,15 @@ class Platform:
             return {**report, **summary}
 
     def trip(self, reason: str = "overtemperature") -> dict:
-        """停堆保护：闩锁 → 镜场收起 → 汽机旁路 → 关母管。"""
+        """停堆保护：闩锁 → 镜场收起 → 汽机旁路 → 关母管。
+
+        原因尽量绑定到该规则当前所在的告警合并组；没有在途告警组（纯手动停堆）
+        时不留组号，复位不做首因恢复校验。
+        """
 
         with self._lock:
             op_id = self.ids.next()
+            group = self.correlator.group_of(reason)
             report = emergency_trip(
                 self.receiver,
                 self.field,
@@ -444,22 +529,53 @@ class Platform:
                 self.history,
                 self.clock.now(),
                 reason,
+                group_id=group.group_id if group else "",
+                root_rule=reason if group else "",
             )
+            if group:
+                self.correlator.mark_tripped(group.group_id)
             summary = self._record_operation(op_id, "receiver_trip", report)
             self._operations += 1
             self._persist()
+            self._publish_root_readiness()
             return {**report, **summary}
 
     def reset_trip(self, operator: str = "shift-lead") -> dict:
-        """复位停堆：先清闩锁，再复位吸热器。"""
+        """复位停堆：首因明确且已恢复 → 清闩锁 → 复位吸热器。"""
 
         with self._lock:
             op_id = self.ids.next()
-            report = reset_after_trip(self.receiver, self.latch, self.clock.now(), operator)
+            report = reset_after_trip(
+                self.receiver,
+                self.latch,
+                self.clock.now(),
+                operator,
+                root_blockers=self._root_blockers(),
+            )
             summary = self._record_operation(op_id, "reset_trip", report)
             self._operations += 1
             self._persist()
+            self._publish_root_readiness()
             return {**report, **summary}
+
+    def assert_alarm_root(self, group_id: str, rule: str, operator: str = "shift-lead") -> dict:
+        """值班员认定挂起告警组的首因（pending 策略下使用）。"""
+
+        with self._lock:
+            amendment = self.correlator.assert_root(group_id, rule, operator, self.clock.now())
+            self.bus.publish(
+                Event.of(
+                    "alarm",
+                    "alarm",
+                    "root_cause_asserted",
+                    severity="warning",
+                    message=f"{operator} 认定首因：{rule}",
+                    asserted_by=operator,
+                    **{k: v for k, v in amendment.items() if k not in ("ts", "operator")},
+                )
+            )
+            self._publish_root_readiness()
+            return amendment
 
     def manual_aim(
         self,
@@ -548,6 +664,40 @@ class Platform:
         with self._lock:
             return self.steam.disturb(delta_mpa)
 
+    def set_signal_lost(self, signal: str, lost: bool = True) -> dict:
+        """注入/恢复一路信号缺失（现场采集失效模拟与故障安全验证用）。"""
+
+        with self._lock:
+            watched = {status.signal for status in self.signal_health.statuses()}
+            if signal not in watched:
+                raise InterlockError(f"未监视的信号: {signal}", component="alarm")
+            if lost:
+                status = self.signal_health.set_lost(signal, self.clock.now())
+                self.bus.publish(
+                    Event.of(
+                        "alarm",
+                        "alarm",
+                        "signal_lost",
+                        severity="alarm" if status.critical else "warning",
+                        message=f"信号缺失（部分失败）：{signal}",
+                        signal=signal,
+                        critical=status.critical,
+                    )
+                )
+            else:
+                status = self.signal_health.set_available(signal, self.clock.now())
+                self.bus.publish(
+                    Event.of(
+                        "alarm",
+                        "alarm",
+                        "signal_restored",
+                        severity="notice",
+                        message=f"信号恢复：{signal}",
+                        signal=signal,
+                    )
+                )
+            return status.as_dict()
+
     def disturb_salt(self, heat_fraction: float) -> dict:
         """注入一次熔盐热负荷扰动。"""
 
@@ -596,13 +746,21 @@ class Platform:
                 "steam": steam_report,
                 "dispatch_pct": round(dispatch_pct, 3),
                 "alarms": [event.as_dict() for event in alarms],
+                "alarm_groups": [
+                    group.as_dict()
+                    for group in self.correlator.groups(include_closed=False)
+                ],
                 "state": self.receiver.state(),
             }
 
     def _signals(self) -> dict:
-        """汇总告警判定需要的现场信号。"""
+        """汇总告警判定需要的现场信号（只含当前可用的信号）。
 
-        return {
+        规则判定对缺失信号本来就是跳过，所以缺失信号在这里直接剔除，由信号健康
+        监视补成 ``signal-lost`` 合成告警——缺失是部分失败，绝不是"这一路无告警"。
+        """
+
+        raw = {
             "receiver_temperature_c": self.receiver.output_temperature_c(),
             "header_pressure_mpa": self.receiver.header.pressure_mpa(),
             "cold_tank_pct": self.salt.cold_tank.level_pct(),
@@ -610,17 +768,72 @@ class Platform:
             "steam_pressure_mpa": self.steam.pressure.value_mpa(),
             "salt_flow_kg_s": self.salt.flow_kg_s(),
         }
+        return {name: value for name, value in raw.items() if self.signal_health.is_available(name)}
+
+    def _event_trips(self, rule: str) -> bool:
+        """规则越限或保护信号缺失是否构成停堆。"""
+
+        if is_lost_rule(rule):
+            return self.signal_health.trips_plant(rule)
+        return self.rules.trips_plant(rule)
 
     def _evaluate_alarms(self, now: float) -> list[AlarmEvent]:
-        """判定告警、写历史与审计，并在越限时触发停堆。"""
+        """判定告警、合并标记、写历史与审计，并在首因越限时触发停堆。"""
 
-        events = self.rules.evaluate(self._signals())
+        present = self._signals()
+        lost_events, recovered_signals = self.signal_health.poll(present, now)
+        # 本就处于缺失的信号没有新边沿，但仍然是当前在报的告警，不能静默。
+        lost_events.extend(
+            event for event in self.signal_health.lost_events()
+            if event.rule not in {item.rule for item in lost_events}
+        )
+        context = {"salt_admitted": self.receiver.header.state() == "admitted"}
+        events = [*self.rules.evaluate(present, context), *lost_events]
+        # 恢复只认两条口径：信号通道恢复（映射到 signal-lost 合成规则）；或规则
+        # 本轮不再报告且原始信号确实回到限值内。使能条件摘掉的规则不算恢复
+        # （停堆关母管不等于低流量恢复）。
+        recovered = [lost_rule(signal) for signal in recovered_signals]
+        active_rules = {event.rule for event in events}
+        for group in self.correlator.groups(include_closed=False):
+            for member in group.members:
+                if member.recovered or member.rule in active_rules:
+                    continue
+                rule = self.rules.by_name(member.rule)
+                if rule is None:
+                    continue  # 合成告警（信号缺失）走信号健康通道恢复。
+                if rule.enable_flag and not context.get(rule.enable_flag):
+                    continue
+                value = present.get(rule.signal)
+                if value is not None and not rule.breached(float(value)):
+                    recovered.append(member.rule)
+
+        recovered_members = self.correlator.mark_cleared(now, recovered) if recovered else []
+        for item in recovered_members:
+            self.bus.publish(
+                Event.of(
+                    "alarm",
+                    "alarm",
+                    "alarm_cleared",
+                    severity="notice",
+                    message=f"{item['rule']} 已恢复",
+                    **item,
+                )
+            )
+        self._publish_root_readiness(now)
+
         if not events:
             return []
         self.history.record_all(now, events)
+        result = self.correlator.ingest(now, events)
+        members = result.raised()
+        by_rule = {member.rule: member for member in members}
         for event in events:
+            if event.rule not in by_rule:
+                continue  # 持续越限：入组去重时已记过，不重复落审计。
+            member = by_rule[event.rule]
             occurrences = self.history.occurrences(event.rule, now - self.escalation.window_s)
             escalated = self.escalation.evaluate(occurrences, event.severity)
+            group = self.correlator.group_of(event.rule)
             self.bus.publish(
                 Event.of(
                     "alarm",
@@ -628,16 +841,142 @@ class Platform:
                     event.rule,
                     severity=event.severity,
                     message=event.message,
-                    value=round(event.value, 3),
-                    threshold=round(event.threshold, 3),
+                    value=None if event.value != event.value else round(event.value, 3),
+                    threshold=None
+                    if event.threshold != event.threshold
+                    else round(event.threshold, 3),
                     level=escalated.level,
                     occurrences=occurrences,
+                    group_id=group.group_id,
+                    role=member.role,
+                    caused_by=member.caused_by,
+                    is_root=member.rule == group.root_rule,
                 )
             )
-        overtemperature = any(item.rule == "receiver-overtemperature" for item in events)
-        if overtemperature and not self.latch.latched():
-            self.trip("overtemperature")
+
+        for amendment in result.amendments:
+            self.bus.publish(
+                Event.of(
+                    "alarm",
+                    "alarm",
+                    "root_cause_reassigned",
+                    severity="warning",
+                    message="停堆首因改判：" + amendment["root_rule"],
+                    **amendment,
+                )
+            )
+        for group in self.correlator.sweep(now):
+            self.bus.publish(
+                Event.of(
+                    "alarm",
+                    "alarm",
+                    "alarm_group_closed",
+                    severity="notice",
+                    message=f"告警组 {group.group_id} 封口",
+                    group_id=group.group_id,
+                    root_rule=group.root_rule,
+                    root_recovered=group.root_recovered(),
+                )
+            )
+
+        # 停堆只认合并组首因：首因规则具备停堆资格才触发，带出的后继不重复停堆。
+        tripping: set[str] = set()
+        for group in result.groups:
+            if group.tripped:
+                continue
+            root = group.root
+            if root in members and self._event_trips(root.rule):
+                tripping.add(root.rule)
+                self.correlator.mark_tripped(group.group_id)
+                self._trip_for_group(group)
+                break
+        if not tripping:
+            self._publish_root_readiness(now)
         return events
+
+    def _trip_for_group(self, group) -> None:
+        """按合并组首因下停堆结论，原因/组/首因三处口径一致。"""
+
+        root = group.root
+        rule = self.rules.by_name(root.rule)
+        reason = root.rule
+        message = rule.message if rule else f"保护信号缺失：{lost_signal(root.rule)}"
+        report = emergency_trip(
+            self.receiver,
+            self.field,
+            self.steam,
+            self.latch,
+            self.history,
+            root.ts,
+            reason,
+            source="alarm-correlator",
+            group_id=group.group_id,
+            root_rule=root.rule,
+        )
+        # 与手动停堆同一条汇总动作落审计，停堆依据全平台只有一个口径。
+        op_id = self.ids.next()
+        self._record_operation(op_id, "receiver_trip", report)
+        self._operations += 1
+        self._persist()
+        self.bus.publish(
+            Event.of(
+                "alarm",
+                "alarm",
+                "root_cause_trip",
+                severity="alarm",
+                message=f"首因停堆：{message}",
+                op_id=op_id,
+                root_rule=root.rule,
+                group_id=group.group_id,
+                violations=report["violations"],
+            )
+        )
+
+    def _root_blockers(self) -> list[str]:
+        """重新投运前的首因硬条件：首因必须明确且已恢复。
+
+        只对当前闩锁仍绑定的停堆首因组生效；闩锁已清（group_id 为空）时不再
+        追溯历史组。投运与复位看到的是同一份校验结果。
+        """
+
+        if not self.latch.latched():
+            return []
+        group_id = self.latch.group_id()
+        if not group_id:
+            return []
+        blockers: list[str] = []
+        try:
+            group = self.correlator.group(group_id)
+        except PlantError:
+            return [f"停堆首因组 {group_id} 查无记录"]
+        if not group.root_resolved:
+            blockers.append(f"首因未明确（告警组 {group_id} 挂起）")
+        if not group.root_recovered():
+            blockers.append(f"停堆首因未恢复：{group.root_rule}")
+        return blockers
+
+    def _publish_root_readiness(self, now: float | None = None) -> None:
+        """发布一条首因恢复状态事件，控制台与审计共用同一口径。"""
+
+        blockers = self._root_blockers()
+        payload = {
+            "group_id": self.latch.group_id(),
+            "root_rule": self.latch.root_rule(),
+            "ready": not blockers,
+            "blockers": blockers,
+        }
+        if now is not None:
+            payload["ts_check"] = round(float(now), 3)
+        self.bus.publish(
+            Event.of(
+                "alarm",
+                "alarm",
+                "root_recovery_status",
+                severity="notice" if not blockers else "warning",
+                message="首因已恢复，可重新投运" if not blockers else "首因未满足投运条件",
+                **payload,
+            )
+        )
 
     def concurrency_probe(self, rounds: int = 24) -> dict:
         """用真实并行调用探测调度与本地保护的仲裁结果。
@@ -762,13 +1101,27 @@ class Platform:
                 "latched": self.latch.latched(),
                 "source": self.latch.source(),
                 "reason": self.latch.reason(),
+                "group_id": self.latch.group_id(),
+                "root_rule": self.latch.root_rule(),
+                "root_blockers": self._root_blockers(),
                 "trips": self.latch.trips(),
                 "resets": self.latch.resets(),
                 "reset_rejections": self.latch.rejections(),
                 "history": self.history.count(),
                 "by_rule": self.history.by_rule(),
                 "rules": self.rules.names(),
+                "merge_policy": {
+                    "mode": "causal_chain",
+                    "follow_window_s": self.correlator.window_s,
+                    "unknown_cause_policy": self.correlator.policy,
+                },
+                "signals": [item.as_dict() for item in self.signal_health.statuses()],
+                "signals_lost": self.signal_health.lost(),
+                "causal_edges": self.causal_graph.describe(),
+                "groups_open": len(self.correlator.groups(include_closed=False)),
+                "groups_pending": len(self.correlator.pending_groups()),
             },
+            "alarm_groups": self.correlator.describe(),
             "levels": self.alert_levels(),
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),

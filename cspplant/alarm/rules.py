@@ -26,19 +26,26 @@ class AlarmEvent:
     message: str
 
     def as_dict(self) -> dict:
+        def clean(number: float) -> float:
+            return None if number != number else round(number, 3)
+
         return {
             "rule": self.rule,
             "severity": self.severity,
             "signal": self.signal,
-            "value": round(self.value, 3),
-            "threshold": round(self.threshold, 3),
+            "value": clean(self.value),
+            "threshold": clean(self.threshold),
             "message": self.message,
         }
 
 
 @dataclass(frozen=True)
 class AlarmRule:
-    """一条告警规则。"""
+    """一条告警规则。
+
+    ``trips_plant`` 标记该规则越限是否构成停堆保护；停堆只认合并组里的首因规则
+    有这个资格，被带出来的后继即使本身是停堆规则也不重复下停堆结论。
+    """
 
     name: str
     signal: str
@@ -46,6 +53,8 @@ class AlarmRule:
     severity: str = ALARM
     above: bool = True
     message: str = ""
+    trips_plant: bool = False
+    enable_flag: str = ""
 
     def breached(self, value: float) -> bool:
         """给定信号值是否越限。"""
@@ -60,6 +69,8 @@ class AlarmRule:
             "severity": self.severity,
             "above": self.above,
             "message": self.message,
+            "trips_plant": self.trips_plant,
+            "enable_flag": self.enable_flag,
         }
 
 
@@ -74,6 +85,7 @@ def default_rules(config: PlatformConfig) -> list[AlarmRule]:
             ALARM,
             True,
             "吸热器出口温度越限",
+            trips_plant=True,
         ),
         AlarmRule(
             "receiver-derate",
@@ -90,6 +102,17 @@ def default_rules(config: PlatformConfig) -> list[AlarmRule]:
             ALARM,
             True,
             "熔盐母管超压",
+            trips_plant=True,
+        ),
+        AlarmRule(
+            "salt-flow-low",
+            "salt_flow_kg_s",
+            config.salt.flow_baseline_kg_s - config.salt.flow_tolerance_kg_s,
+            ALARM,
+            False,
+            "熔盐流量低于联锁门限",
+            trips_plant=True,
+            enable_flag="salt_admitted",
         ),
         AlarmRule(
             "cold-tank-low",
@@ -132,12 +155,19 @@ class AlarmRules:
         self.rules.append(rule)
         return rule
 
-    def evaluate(self, signals: dict) -> list[AlarmEvent]:
-        """判定本轮越限，返回触发的告警。"""
+    def evaluate(self, signals: dict, context: dict | None = None) -> list[AlarmEvent]:
+        """判定本轮越限，返回触发的告警。
 
+        带 ``enable_flag`` 的规则只在上下文中对应标志为真时才判（例如低流量
+        联锁只在母管已通盐后成立，冷态零流量是正常工况不是故障）。
+        """
+
+        context = context or {}
         raised: list[AlarmEvent] = []
         for rule in self.rules:
             if rule.signal not in signals:
+                continue
+            if rule.enable_flag and not bool(context.get(rule.enable_flag)):
                 continue
             value = float(signals[rule.signal])
             if rule.breached(value):
@@ -157,6 +187,20 @@ class AlarmRules:
         """返回全部规则名。"""
 
         return [rule.name for rule in self.rules]
+
+    def by_name(self, name: str) -> AlarmRule | None:
+        """按规则名查找。"""
+
+        for rule in self.rules:
+            if rule.name == name:
+                return rule
+        return None
+
+    def trips_plant(self, name: str) -> bool:
+        """该规则越限是否构成停堆保护。"""
+
+        rule = self.by_name(name)
+        return bool(rule and rule.trips_plant)
 
     def describe(self) -> list[dict]:
         """返回规则表的可打印形式。"""
